@@ -1,0 +1,685 @@
+from __future__ import annotations
+import argparse
+import collections
+import functools
+import json
+import math
+import platform
+import random
+import statistics
+import sys
+import time
+import traceback
+from pathlib import Path
+FRONT_SIZES = (1_000, 3_000, 10_000, 30_000, 100_000)
+FRONT_OPS = 1_000
+FIB_NS = (5, 10, 15, 20, 25, 30)
+REPEATS = 5
+
+from LAB02 import (
+    CALLS,
+    Deque,
+    DynamicArray,
+    Stack,
+    factorial,
+    fib_memo,
+    fib_naive,
+    hanoi,
+)
+
+# Проверки и измерения на основе заготовки преподавателя
+
+Op = tuple[str, int | None]
+
+
+def find_data_dir(explicit: Path | None) -> Path:
+
+    if explicit is not None:
+        if not explicit.is_dir():
+            raise SystemExit(f"Каталог не найден: {explicit}")
+        return explicit
+    candidates = []
+    for base in (Path.cwd(), Path(__file__).resolve().parent):
+        for parent in (base, *base.parents):
+            candidates.append(parent / "data" / "generated")
+    for path in candidates:
+        if path.is_dir():
+            return path
+    raise SystemExit(
+        "Не найден каталог data/generated с данными варианта.\n"
+        "Сгенерируйте данные из корня репозитория курса:\n"
+        "    python scripts/generate_data.py --variant N --only ops\n"
+        "или укажите каталог явно: --data <путь>")
+
+
+def check_variant(data_dir: Path, variant: int) -> None:
+
+    manifest_path = data_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise SystemExit("Нет manifest.json. Сгенерируйте данные своего варианта.")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    actual = manifest.get("variant")
+    if actual != variant:
+        raise SystemExit(
+            f"Данные в {data_dir} сгенерированы для варианта {actual}, "
+            f"а работа запущена с --variant {variant}.\n"
+            f"Перегенерируйте данные: "
+            f"python scripts/generate_data.py --variant {variant} --only ops")
+    if manifest.get("seed") != 30 + variant:
+        raise SystemExit("Seed в manifest.json не соответствует варианту")
+    print(f"Данные варианта {variant} (seed={manifest.get('seed')}) из {data_dir}")
+
+
+def read_data_lines(data_dir: Path, name: str) -> list[str]:
+
+    path = data_dir / name
+    if not path.is_file():
+        raise SystemExit(
+            f"Не найден файл данных: {path}\n"
+            f"Сгенерируйте его: python scripts/generate_data.py "
+            f"--variant <ваш вариант> --only ops")
+    return path.read_text(encoding="utf-8").splitlines()
+
+
+def load_append_sizes(data_dir: Path) -> list[int]:
+
+    sizes = [int(line) for line in read_data_lines(data_dir, "ops_append_sizes.txt")]
+    if len(sizes) < 5 or any(n <= 0 for n in sizes):
+        raise SystemExit("Для append ожидаются минимум пять положительных размеров")
+    return sizes
+
+
+def load_ops(data_dir: Path, kind: str) -> list[Op]:
+
+    ops: list[Op] = []
+    for line in read_data_lines(data_dir, f"ops_{kind}.txt"):
+        name, *arg = line.split()
+        ops.append((name, int(arg[0]) if arg else None))
+    if not ops:
+        raise SystemExit("Файл операций пуст")
+    return ops
+
+
+# 5. Репрезентативные тесты и инварианты
+
+
+class SelfCheckError(Exception):
+    pass
+
+
+def expect(condition: bool, message: str) -> None:
+
+    if not condition:
+        raise SelfCheckError(message)
+
+
+def expect_index_error(call, what: str) -> None:
+
+    try:
+        call()
+    except IndexError:
+        return
+    raise SelfCheckError(f"{what}: ожидался IndexError")
+
+
+def stack_methods(st: Stack) -> dict:
+    return {"push": st.push, "pop": st.pop, "peek": st.peek, "len": st.__len__}
+
+
+def list_stack_methods(a: list) -> dict:
+    return {"push": a.append, "pop": a.pop, "peek": lambda: a[-1], "len": a.__len__}
+
+
+def deque_methods(dq: Deque) -> dict:
+    return {"push_front": dq.push_front, "push_back": dq.push_back,
+            "pop_front": dq.pop_front, "pop_back": dq.pop_back, "len": dq.__len__}
+
+
+def std_deque_methods(d: collections.deque) -> dict:
+    return {"push_front": d.appendleft, "push_back": d.append,
+            "pop_front": d.popleft, "pop_back": d.pop, "len": d.__len__}
+
+
+def apply_op(methods: dict, op: str, arg: int | None):
+
+    try:
+        return methods[op]() if arg is None else methods[op](arg)
+    except IndexError:
+        return "IndexError"
+
+
+def compare_with_reference(ops: list[Op], own: dict, ref: dict, label: str) -> None:
+
+    for i, (op, arg) in enumerate(ops, start=1):
+        call = op if arg is None else f"{op} {arg}"
+        got, expected = apply_op(own, op, arg), apply_op(ref, op, arg)
+        expect(got == expected,
+               f"{label}, операция №{i} ({call}): получено {got!r}, эталон {expected!r}")
+        expect(own["len"]() == ref["len"](),
+               f"{label}, операция №{i} ({call}): len = {own['len']()}, эталон {ref['len']()}")
+
+
+def random_ops(rng: random.Random, pushes: tuple[str, ...], others: tuple[str, ...],
+               count: int, max_size: int) -> list[Op]:
+
+    ops: list[Op] = []
+    size = 0
+    for _ in range(count):
+        op = rng.choice(pushes + others)
+        if op in pushes and size >= max_size:
+            op = rng.choice(others)
+        if op in pushes:
+            ops.append((op, rng.randrange(100)))
+            size += 1
+        else:
+            ops.append((op, None))
+            size = max(0, size - op.startswith("pop"))
+    return ops
+
+
+def expected_capacity(size: int) -> int:
+
+    cap = DynamicArray.INITIAL_CAPACITY
+    while cap < size:
+        cap *= 2
+    return cap
+
+
+def expected_copies(size: int) -> int:
+
+    copies, cap = 0, DynamicArray.INITIAL_CAPACITY
+    while cap < size:
+        copies += cap
+        cap *= 2
+    return copies
+
+
+def check_recursion() -> None:
+
+    for n in range(21):
+        got = factorial(n)
+        expect(got == math.factorial(n), f"factorial({n}) = {got}, ожидалось {math.factorial(n)}")
+
+    fib = [0, 1]
+    while len(fib) <= 90:
+        fib.append(fib[-1] + fib[-2])
+    for n in range(21):
+        got = fib_naive(n)
+        expect(got == fib[n], f"fib_naive({n}) = {got}, ожидалось {fib[n]}")
+    CALLS["fib_naive"] = 0
+    fib_naive(20)
+    expect(CALLS["fib_naive"] >= fib[20],
+           f"fib_naive(20): число вызовов {CALLS['fib_naive']} — это не наивная рекурсия")
+    for n in (0, 1, 2, 10, 30, 90):
+        CALLS["fib_memo"] = 0
+        got = fib_memo(n)
+        expect(got == fib[n], f"fib_memo({n}) = {got}, ожидалось {fib[n]}")
+        expect(CALLS["fib_memo"] <= 2 * n + 1,
+               f"fib_memo({n}): число вызовов {CALLS['fib_memo']}, а с мемоизацией оно "
+               f"не больше 2n + 1 = {2 * n + 1} — memo не передаётся в рекурсию?")
+
+    for n, (src, dst, aux) in ((0, "ACB"), (1, "ACB"), (2, "ACB"), (3, "XZY"),
+                               (6, "ACB"), (7, "PQR")):
+        where = f"hanoi({n}, {src!r}, {dst!r}, {aux!r})"
+        moves: list[tuple[str, str]] = []
+        count = hanoi(n, src, dst, aux, moves)
+        expect(count == 2 ** n - 1, f"{where} вернул {count}, ожидалось {2 ** n - 1}")
+        expect(len(moves) == count, f"{where}: записано ходов {len(moves)}, возвращено {count}")
+        towers = {src: list(range(n, 0, -1)), dst: [], aux: []}
+        for k, move in enumerate(moves, start=1):
+            expect(len(move) == 2 and move[0] in towers and move[1] in towers
+                   and move[0] != move[1],
+                   f"{where}, ход {k}: {move!r} — не пара разных стержней из {src}, {dst}, {aux}")
+            frm, to = move
+            expect(bool(towers[frm]), f"{where}, ход {k}: стержень {frm} пуст")
+            disk = towers[frm].pop()
+            top = towers[to][-1] if towers[to] else None
+            expect(top is None or top > disk,
+                   f"{where}, ход {k}: диск {disk} кладётся на меньший диск {top}")
+            towers[to].append(disk)
+        expect(towers[dst] == list(range(n, 0, -1)),
+               f"{where}: после всех ходов на стержне {dst} лежит {towers[dst]}")
+        expect(hanoi(n, src, dst, aux) == count, f"{where} без moves вернул другое число")
+
+
+def check_dynamic_array() -> None:
+
+    initial = DynamicArray.INITIAL_CAPACITY
+    arr = DynamicArray()
+    expect(len(arr) == 0 and arr.capacity == initial,
+           f"пустой массив: len = {len(arr)}, capacity = {arr.capacity}")
+    expect_index_error(lambda: arr.get(0), "get(0) пустого массива")
+    expect_index_error(lambda: arr.set(0, 1), "set(0, 1) пустого массива")
+    expect_index_error(arr.pop, "pop() пустого массива")
+
+    ref: list[int] = []
+    for i in range(100):
+        arr.append(i * i)
+        ref.append(i * i)
+        size = len(ref)
+        expect(len(arr) == size, f"после {size} append: len = {len(arr)}")
+        expect(arr.capacity == expected_capacity(size),
+               f"после {size} append: capacity = {arr.capacity}, ожидалось "
+               f"{expected_capacity(size)} (расширение x2 и только при size == capacity)")
+        expect(arr.copies == expected_copies(size),
+               f"после {size} append: copies = {arr.copies}, ожидалось {expected_copies(size)}")
+    for i, value in enumerate(ref):
+        got = arr.get(i)
+        expect(got == value, f"get({i}) = {got!r}, ожидалось {value!r}")
+    arr.set(0, -1)
+    arr.set(99, -99)
+    ref[0], ref[99] = -1, -99
+    expect(arr.get(0) == -1 and arr.get(99) == -99, "set(0, ...) или set(99, ...) не изменил элемент")
+    for bad in (100, arr.capacity - 1, arr.capacity, -1, -100):
+        expect_index_error(lambda bad=bad: arr.get(bad), f"get({bad}) при size = 100")
+        expect_index_error(lambda bad=bad: arr.set(bad, 0), f"set({bad}, 0) при size = 100")
+
+
+    for refill in (70, 0):
+        while ref:
+            cap_before = arr.capacity
+            got, expected = arr.pop(), ref.pop()
+            size = len(ref)
+            expect(got == expected, f"pop() при size = {size + 1}: {got!r}, ожидалось {expected!r}")
+            expect(len(arr) == size, f"после pop(): len = {len(arr)}, ожидалось {size}")
+            expect(arr.capacity == cap_before
+                   or (arr.capacity == cap_before // 2 and size <= cap_before // 4
+                       and arr.capacity >= initial),
+                   f"pop() при size = {size + 1}: capacity {cap_before} -> {arr.capacity}; "
+                   f"сжимать можно только вдвое, при size <= capacity // 4 и не ниже {initial}")
+        expect_index_error(arr.pop, "pop() опустошённого массива")
+        for i in range(refill):
+            arr.append(i)
+            ref.append(i)
+            expect(len(arr) == len(ref) <= arr.capacity,
+                   f"повторный рост: len = {len(arr)}, capacity = {arr.capacity}")
+        for i, value in enumerate(ref):
+            got = arr.get(i)
+            expect(got == value, f"после повторного роста get({i}) = {got!r}, ожидалось {value!r}")
+
+
+def check_stack() -> None:
+
+    st = Stack()
+    expect(len(st) == 0, f"пустой стек: len = {len(st)}")
+    expect_index_error(st.pop, "pop() пустого стека")
+    expect_index_error(st.peek, "peek() пустого стека")
+
+    for start in (0, 100):
+        values = list(range(start, start + 20))
+        for k, x in enumerate(values, start=1):
+            st.push(x)
+            top = st.peek()
+            expect(top == x and len(st) == k, f"после push({x}): peek() = {top!r}, len = {len(st)}")
+        top = st.peek()
+        expect(top == values[-1] and len(st) == len(values), "повторный peek() изменил стек")
+        for k, expected in enumerate(reversed(values), start=1):
+            got = st.pop()
+            expect(got == expected, f"pop() №{k}: {got!r}, ожидалось {expected!r} (LIFO)")
+            expect(len(st) == len(values) - k, f"после pop() №{k}: len = {len(st)}")
+        expect_index_error(st.pop, "pop() опустошённого стека")
+        expect_index_error(st.peek, "peek() опустошённого стека")
+
+    own, ref = Stack(), []
+    ops = random_ops(random.Random(1), ("push",), ("pop", "peek"), count=3_000, max_size=40)
+    compare_with_reference(ops, stack_methods(own), list_stack_methods(ref),
+                           "Stack против list, случайная серия")
+
+
+def check_deque() -> None:
+
+    dq = Deque()
+    expect(len(dq) == 0, f"пустой дек: len = {len(dq)}")
+    expect_index_error(dq.pop_front, "pop_front() пустого дека")
+    expect_index_error(dq.pop_back, "pop_back() пустого дека")
+
+
+    pushes, pops = ("push_front", "push_back"), ("pop_front", "pop_back")
+    for push1 in pushes:
+        for pop1 in pops:
+            for push2 in pushes:
+                for pop2 in pops:
+                    dq = Deque()
+                    story = f"{push1}(1), {pop1}(), {push2}(2), {pop2}()"
+                    getattr(dq, push1)(1)
+                    first = getattr(dq, pop1)()
+                    getattr(dq, push2)(2)
+                    second = getattr(dq, pop2)()
+                    expect((first, second, len(dq)) == (1, 2, 0),
+                           f"{story}: извлечено {first!r} и {second!r}, len = {len(dq)}")
+                    expect_index_error(dq.pop_front, f"{story}, затем pop_front()")
+                    expect_index_error(dq.pop_back, f"{story}, затем pop_back()")
+
+    own, ref = Deque(), collections.deque()
+    ops = random_ops(random.Random(2), pushes, pops, count=5_000, max_size=12)
+    compare_with_reference(ops, deque_methods(own), std_deque_methods(ref),
+                           "Deque против collections.deque, случайная серия")
+
+
+def check_variant_ops(stack_ops: list[Op], deque_ops: list[Op]) -> None:
+
+    compare_with_reference(stack_ops, stack_methods(Stack()), list_stack_methods([]),
+                           "ops_stack.txt")
+    compare_with_reference(deque_ops, deque_methods(Deque()),
+                           std_deque_methods(collections.deque()), "ops_deque.txt")
+
+
+def check_internal_invariants():
+    rng = random.Random(49)
+    arr = DynamicArray()
+    reference = []
+    for step in range(500):
+        if rng.randrange(2) == 0:
+            value = rng.randrange(-100, 101)
+            arr.append(value)
+            reference.append(value)
+        elif reference:
+            expect(arr.pop() == reference.pop(), "Неверный результат pop")
+        else:
+            expect_index_error(arr.pop, "pop пустого массива")
+        expect(0 <= arr._size <= arr.capacity, "Нарушен size <= capacity")
+        expect(len(arr._buffer) == arr.capacity, "Размер буфера не равен ёмкости")
+        expect(arr._size == len(reference), "Неверный размер массива")
+        for i, value in enumerate(reference):
+            expect(arr.get(i) == value, "Элемент массива отличается от эталона")
+        for i in range(arr._size, arr.capacity):
+            expect(arr._buffer[i] is None, "Свободная ячейка удерживает значение")
+
+    dq = Deque()
+    reference = collections.deque()
+    ops = random_ops(rng, ("push_front", "push_back"),
+                     ("pop_front", "pop_back"), count=1000, max_size=20)
+    own_methods = deque_methods(dq)
+    ref_methods = std_deque_methods(reference)
+    for op, arg in ops:
+        expect(apply_op(own_methods, op, arg) == apply_op(ref_methods, op, arg),
+               "Операции дека различаются с эталоном")
+        expect(len(dq) == len(reference), "Неверный размер дека")
+        if len(dq) == 0:
+            expect(dq._head is None and dq._tail is None, "Пустой дек содержит крайние узлы")
+            continue
+        expect(dq._head.prev is None, "У первого узла есть предыдущий")
+        expect(dq._tail.next is None, "У последнего узла есть следующий")
+        node, previous = dq._head, None
+        values = []
+        seen = set()
+        while node is not None:
+            expect(id(node) not in seen, "В деке образовался цикл")
+            seen.add(id(node))
+            expect(node.prev is previous, "Неверная обратная ссылка")
+            values.append(node.value)
+            previous, node = node, node.next
+        expect(previous is dq._tail, "Последний узел не совпадает с tail")
+        expect(values == list(reference), "Порядок элементов дека нарушен")
+
+
+def self_check(stack_ops: list[Op], deque_ops: list[Op]) -> None:
+
+    checks = (
+        ("рекурсия", check_recursion),
+        ("DynamicArray", check_dynamic_array),
+        ("Stack", check_stack),
+        ("Deque", check_deque),
+        ("операции варианта", lambda: check_variant_ops(stack_ops, deque_ops)),
+        ("внутренние инварианты", check_internal_invariants),
+    )
+    failed = 0
+    print("self_check:")
+    for name, check in checks:
+        try:
+            check()
+        except NotImplementedError as err:
+            where = traceback.extract_tb(err.__traceback__)[-1].name
+            print(f"  {name}: не реализовано — {where}")
+            failed += 1
+        except SelfCheckError as err:
+            print(f"  {name}: ОШИБКА — {err}")
+            failed += 1
+        except Exception:
+            print(f"  {name}: ИСКЛЮЧЕНИЕ")
+            traceback.print_exc(file=sys.stdout)
+            failed += 1
+        else:
+            print(f"  {name}: OK")
+
+    if failed:
+        raise SystemExit(f"self_check: не пройдено разделов — {failed}; "
+                         f"замеры выполняются только после всех проверок.")
+    print("self_check: OK")
+
+
+# 6. Замеры
+
+
+def bench(call) -> float:
+
+    call()
+    times = []
+    for _ in range(REPEATS):
+        t0 = time.perf_counter()
+        call()
+        times.append(time.perf_counter() - t0)
+    return statistics.median(times)
+
+
+def log_log_slope(points: list[tuple[int, float]]) -> float:
+
+    xs = [math.log10(n) for n, _ in points]
+    ys = [math.log10(t) for _, t in points]
+    mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+    return (sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+            / sum((x - mx) ** 2 for x in xs))
+
+
+def appends(add, n: int) -> None:
+
+    for i in range(n):
+        add(i)
+
+
+def steady_ops(add, remove, k: int = FRONT_OPS) -> None:
+
+    for i in range(k):
+        add(i)
+        remove()
+
+
+def replay(ops: list[Op], methods: dict) -> None:
+
+    for op, arg in ops:
+        try:
+            if arg is None:
+                methods[op]()
+            else:
+                methods[op](arg)
+        except IndexError:
+            pass
+
+
+def filled_structure(kind: str, n: int):
+
+    if kind == "list":
+        return list(range(n))
+    if kind == "deque":
+        return collections.deque(range(n))
+    dq = Deque()
+    appends(dq.push_back, n)
+    return dq
+
+
+FRONT_CASES = {
+    "insert": (
+        ("list.insert(0, x) + pop()", "list", lambda a: (functools.partial(a.insert, 0), a.pop)),
+        ("deque.appendleft + pop", "deque", lambda d: (d.appendleft, d.pop)),
+        ("Deque.push_front + pop_back", "Deque", lambda d: (d.push_front, d.pop_back)),
+    ),
+    "remove": (
+        ("list.append + pop(0)", "list", lambda a: (a.append, functools.partial(a.pop, 0))),
+        ("deque.append + popleft", "deque", lambda d: (d.append, d.popleft)),
+        ("Deque.push_back + pop_front", "Deque", lambda d: (d.push_back, d.pop_front)),
+    ),
+}
+FRONT_TITLES = {"insert": "Вставка в начало", "remove": "Удаление из начала"}
+
+
+def run_benchmarks(append_sizes: list[int], stack_ops: list[Op],
+                   deque_ops: list[Op]) -> dict:
+
+    results: dict = {"fib_calls": [], "variant_ops": []}
+
+    print("\nЧисло вызовов: наивная рекурсия против мемоизации")
+    for n in FIB_NS:
+        CALLS["fib_naive"] = CALLS["fib_memo"] = 0
+        value = fib_naive(n)
+        fib_memo(n)
+        results["fib_calls"].append({
+            "n": n, "value": value,
+            "naive_calls": CALLS["fib_naive"], "memo_calls": CALLS["fib_memo"],
+        })
+        print(f"  n={n:>2}  F(n)={value:>6}  fib_naive: {CALLS['fib_naive']:>7} вызовов"
+              f"  fib_memo: {CALLS['fib_memo']:>2} вызовов")
+
+
+    print("\nСерии append на размерах варианта:")
+    results["append"] = []
+    for n in append_sizes:
+        t_own = bench(lambda: appends(DynamicArray().append, n)) / n
+        t_list = bench(lambda: appends([].append, n)) / n
+        arr = DynamicArray()
+        appends(arr.append, n)
+        cost = (n + arr.copies) / n
+        results["append"].append((n, t_own, t_list, cost, arr.copies))
+        print(f"  n={n:>7}  t/n: DynamicArray {t_own:.2e} c, list {t_list:.2e} c"
+              f"  копирований {arr.copies:>7}  (n + копирования)/n = {cost:.3f}")
+
+
+    for key, title in FRONT_TITLES.items():
+        print(f"\n{title}: время одной операции при размере n = "
+              f"{', '.join(map(str, FRONT_SIZES))}")
+        results[key] = {}
+        for label, kind, methods in FRONT_CASES[key]:
+            points = []
+            for n in FRONT_SIZES:
+                add, remove = methods(filled_structure(kind, n))
+                points.append((n, bench(lambda: steady_ops(add, remove)) / FRONT_OPS))
+            results[key][label] = points
+            row = "  ".join(f"{t:.2e}" for _, t in points)
+            print(f"  {label:28s} {row}   наклон {log_log_slope(points):.2f}")
+
+    print("\nОперации варианта целиком: время на операцию")
+    cases = (
+        ("ops_stack.txt", stack_ops, "Stack", lambda: stack_methods(Stack()),
+         "list", lambda: list_stack_methods([])),
+        ("ops_deque.txt", deque_ops, "Deque", lambda: deque_methods(Deque()),
+         "collections.deque", lambda: std_deque_methods(collections.deque())),
+    )
+    for name, ops, own_label, make_own, ref_label, make_ref in cases:
+        t_own = bench(lambda: replay(ops, make_own())) / len(ops)
+        t_ref = bench(lambda: replay(ops, make_ref())) / len(ops)
+        results["variant_ops"].append({
+            "file": name, "count": len(ops), "own": own_label,
+            "reference": ref_label, "own_seconds": t_own, "reference_seconds": t_ref,
+        })
+        print(f"  {name}: {own_label} {t_own:.2e} c, {ref_label} {t_ref:.2e} c"
+              f" — в {t_own / t_ref:.1f} раза медленнее")
+
+
+    return results
+
+
+# 7. Графики
+
+
+def plot_results(results: dict, out_dir: Path) -> None:
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("\nmatplotlib не установлен — графики пропущены "
+              "(pip install -r requirements.txt)")
+        return
+
+    rows = results["append"]
+    ns = [row[0] for row in rows]
+    fig, (ax_t, ax_c) = plt.subplots(1, 2, figsize=(12, 4.5))
+    ax_t.plot(ns, [row[1] for row in rows], marker="o", label="DynamicArray.append")
+    ax_t.plot(ns, [row[2] for row in rows], marker="s", label="list.append")
+    ax_t.set_xscale("log")
+    ax_t.set_xlabel("число операций n")
+    ax_t.set_ylabel("время на операцию t/n, с")
+    ax_t.set_title("Средняя стоимость append")
+    ax_t.grid(True, which="both", linewidth=0.3)
+    ax_t.legend()
+    ax_c.plot(ns, [row[3] for row in rows], marker="o", label="(n + копирования)/n")
+    ax_c.axhline(3, color="grey", linestyle="--", label="оценка методом учёта")
+    ax_c.set_xscale("log")
+    ax_c.set_ylim(0, 3.5)
+    ax_c.set_xlabel("число операций n")
+    ax_c.set_ylabel("записей и копирований на операцию")
+    ax_c.set_title("DynamicArray: стоимость в элементарных действиях")
+    ax_c.grid(True, which="both", linewidth=0.3)
+    ax_c.legend(loc="lower right")
+    fig.tight_layout()
+    append_path = out_dir / "lab02_append.png"
+    fig.savefig(append_path, dpi=150)
+    plt.close(fig)
+
+    fig2, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharey=True)
+    for ax, (key, title) in zip(axes, FRONT_TITLES.items()):
+        for label, points in results[key].items():
+            ax.plot([n for n, _ in points], [t for _, t in points], marker="o",
+                    label=f"{label} (наклон ≈ {log_log_slope(points):.2f})")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel("размер структуры n")
+        ax.set_title(title)
+        ax.grid(True, which="both", linewidth=0.3)
+        ax.legend(fontsize=8)
+    axes[0].set_ylabel("время одной операции, с")
+    fig2.tight_layout()
+    front_path = out_dir / "lab02_front.png"
+    fig2.savefig(front_path, dpi=150)
+    plt.close(fig2)
+
+    print(f"\nГрафики сохранены:\n  {append_path}\n  {front_path}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Лабораторная 2 — рекурсия и линейные структуры",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--variant", type=int, default=19, help="номер варианта")
+    ap.add_argument("--data", type=Path, default=None,
+                    help="каталог с данными варианта (по умолчанию ищется data/generated)")
+    ap.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "results" / "lab02",
+                    help="каталог для графиков (по умолчанию текущий)")
+    ap.add_argument("--check-only", action="store_true", help="только проверки")
+    args = ap.parse_args()
+
+    data_dir = find_data_dir(args.data)
+    check_variant(data_dir, args.variant)
+    append_sizes = load_append_sizes(data_dir)
+    stack_ops = load_ops(data_dir, "stack")
+    deque_ops = load_ops(data_dir, "deque")
+
+    self_check(stack_ops, deque_ops)
+    if args.check_only:
+        return
+    args.out.mkdir(parents=True, exist_ok=True)
+    results = run_benchmarks(append_sizes, stack_ops, deque_ops)
+    payload = {
+        "variant": args.variant, "seed": 30 + args.variant,
+        "python": platform.python_version(), "platform": platform.platform(),
+        "repeats": REPEATS, "front_pairs_per_sample": FRONT_OPS,
+        "append_columns": ["n", "own_seconds", "list_seconds", "cost", "copies"],
+        "results": results,
+    }
+    result_file = args.out / "lab02_results.json"
+    result_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Результаты измерений: {result_file}")
+    plot_results(results, args.out)
+
+
+if __name__ == "__main__":
+    main()
